@@ -10,64 +10,18 @@ try:
 except ImportError:
     from langchain.text_splitter import RecursiveCharacterTextSplitter
 
-
-def build_vector_index(text, openai_key):
-    """
-    Build a FAISS vector index from resume text.
-    
-    Args:
-        text: Resume text content
-        openai_key: OpenAI API key for embeddings
-        
-    Returns:
-        FAISS: Vector store index
-    """
-    try:
-        # Split text into chunks for better embedding
-        splitter = RecursiveCharacterTextSplitter(
-            chunk_size=800,
-            chunk_overlap=100,
-            length_function=len,
+def _get_embeddings(openai_key: str | None, use_local: bool):
+    if use_local or not openai_key:
+        from langchain_huggingface import HuggingFaceEmbeddings
+        return HuggingFaceEmbeddings(
+            model_name="sentence-transformers/all-MiniLM-L6-v2"
         )
-        
-        # Create text chunks
-        chunks = splitter.split_text(text)
-        
-        # Initialize embeddings
-        # Try new API first, fallback to old API
-        try:
-            embeddings = OpenAIEmbeddings(api_key=openai_key)
-        except TypeError:
-            embeddings = OpenAIEmbeddings(openai_api_key=openai_key)
-        
-        # Build FAISS vector store
-        vector_store = FAISS.from_texts(chunks, embeddings)
-        
-        return vector_store
-    except Exception as e:
-        error_msg = str(e)
-        # Check for specific OpenAI API errors
-        if "429" in error_msg or "insufficient_quota" in error_msg or "quota" in error_msg.lower():
-            raise Exception(
-                "OpenAI API Quota Exceeded. Check billing at https://platform.openai.com/account/billing"
-            )
-        elif "401" in error_msg or "invalid_api_key" in error_msg.lower():
-            raise Exception(
-                "Invalid OpenAI API Key. Check your .env file."
-            )
-        else:
-            raise Exception(f"Error building vector index: {error_msg}")
+    from langchain_openai import OpenAIEmbeddings
+    return OpenAIEmbeddings(api_key=openai_key)
 
 
-def query_vectorstore(store, query, k=3):
-    try:
-        # Perform similarity search
-        results = store.similarity_search(query, k=k)
-        
-        # Extract page content from results
-        suggestions = [r.page_content for r in results]
-        
-        return suggestions
-    except Exception as e:
-        raise Exception(f"Error querying vector store: {str(e)}")
-
+def build_vector_index(text, openai_key=None, use_local=False):
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=800, chunk_overlap=100, length_function=len)
+    chunks = splitter.split_text(text)
+    return FAISS.from_texts(chunks, _get_embeddings(openai_key, use_local))
