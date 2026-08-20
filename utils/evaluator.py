@@ -1,303 +1,128 @@
-try:
-    from langchain_core.prompts import PromptTemplate
-except ImportError:
-    from langchain.prompts import PromptTemplate
+from __future__ import annotations
 
-try:
-    from langchain_openai import ChatOpenAI
-except ImportError:
-    from langchain.chat_models import ChatOpenAI
 import json
 import os
+import re
 from datetime import datetime
+from typing import List, Optional, Tuple
+
+from pydantic import ValidationError
+
+from .prompts import (
+    JD_CHAR_LIMIT, PROMPT_TEMPLATE, REPAIR_SUFFIX,
+    RESUME_LIMIT_CLOUD, RESUME_LIMIT_LOCAL, Evaluation,
+)
 
 
-def evaluate_resume(job_desc, resume_text, openai_key=None, model_name="gpt-3.5-turbo", use_local=False, local_model_url=None):
-    """
-    Evaluate resume against job description using OpenAI or local LLM.
-    
-    Args:
-        job_desc: Job description text
-        resume_text: Resume text content
-        openai_key: OpenAI API key (required if use_local=False)
-        model_name: Model to use (default: gpt-3.5-turbo, options: gpt-3.5-turbo, gpt-4, gpt-4-turbo)
-        use_local: Whether to use local LLM via Ollama
-        local_model_url: URL for local Ollama API (default: http://localhost:11434)
-        
-    Returns:
-        str: Formatted evaluation report
-    """
+# ---------- backends ----------
+def _call_ollama(prompt: str, model: str, base_url: str) -> str:
+    import ollama
+    client = ollama.Client(host=base_url)
+    resp = client.generate(
+        model=model,
+        prompt=prompt,
+        format="json",                       # forces valid JSON from Ollama
+        options={"temperature": 0.0, "num_predict": 1500, "num_ctx": 8192},
+    )
+    return resp.get("response", "")
+
+
+def _call_openai(prompt: str, model: str, api_key: str) -> str:
+    from langchain_openai import ChatOpenAI
+    llm = ChatOpenAI(
+        model=model, temperature=0.0, api_key=api_key,
+        model_kwargs={"response_format": {"type": "json_object"}},
+    )
+    r = llm.invoke(prompt)
+    return getattr(r, "content", str(r))
+
+
+def call_llm(prompt: str, *, use_local: bool, model_name: str,
+             openai_key: Optional[str] = None,
+             local_model_url: str = "http://localhost:11434") -> str:
+    """Dispatch to Ollama or OpenAI. Raises with an actionable message."""
+    if use_local:
+        try:
+            return _call_ollama(prompt, model_name, local_model_url)
+        except ImportError as e:
+            raise RuntimeError("pip install ollama  (and: ollama serve)") from e
+        except Exception as e:
+            m = str(e).lower()
+            if "not found" in m:
+                raise RuntimeError(f"Model missing. Run: ollama pull {model_name}") from e
+            if "connection" in m or "refused" in m:
+                raise RuntimeError("Ollama not reachable. Run: ollama serve") from e
+            raise RuntimeError(f"Ollama error: {e}") from e
+
+    if not openai_key:
+        raise RuntimeError("OPENAI_API_KEY missing in .env")
     try:
-        if use_local:
-            # Use local Ollama LLM - Try multiple methods
-            try:
-                # Method 1: Try direct ollama package (most reliable)
-                import ollama
-                
-                # Create prompt template first
-                template = PromptTemplate(
-                    input_variables=["job", "resume"],
-                    template="""
-You are an expert HR AI analyst with years of experience in recruitment and talent assessment.
-
-Compare the following resume with the job description and provide a comprehensive evaluation:
-
-1. **Overall Fit Score**: A numerical score from 0-100 indicating how well the candidate matches the job requirements.
-
-2. **Key Matching Skills**: List the top skills from the resume that directly match the job description requirements.
-
-3. **Missing Skills**: Identify critical skills mentioned in the job description that are not evident in the resume.
-
-4. **Suggested Improvements**: Provide 5-7 actionable bullet points on how the candidate can improve their resume to better match this job.
-
-5. **Strengths**: Highlight 3-5 key strengths of the candidate relevant to this role.
-
-6. **Weaknesses**: Identify 2-3 areas where the candidate may fall short.
-
-Format your response clearly with headers and bullet points for easy reading.
-
-JOB DESCRIPTION:
-{job}
-
-RESUME:
-{resume}
-
-Provide your evaluation:
-"""
-                )
-                
-                resume_limit = 4000 if use_local else 6000
-                prompt = template.format(
-                    job=job_desc[:3000],
-                    resume=resume_text[:resume_limit]
-                )
-                
-                try:
-                    response = ollama.generate(
-                        model=model_name,
-                        prompt=prompt,
-                        options={
-                            'temperature': 0.3,
-                            'num_predict': 1500,
-                            'num_ctx': 4096
-                        }
-                    )
-                    
-                    result = response.get('response', '')
-                    if not result:
-                        return "## Error: Empty response from Ollama\n\nTry again or use a different model."
-                    
-                    return result
-                    
-                except Exception as e:
-                    error_msg = str(e)
-                    if "model" in error_msg.lower() and "not found" in error_msg.lower():
-                        raise Exception(f"Model '{model_name}' not found. Run: ollama pull {model_name}")
-                    elif "connection" in error_msg.lower() or "refused" in error_msg.lower():
-                        raise Exception("Cannot connect to Ollama. Make sure Ollama is running: `ollama serve`")
-                    else:
-                        raise Exception(f"Ollama error: {error_msg}")
-                
-            except ImportError:
-                try:
-                    try:
-                        from langchain_community.llms import Ollama
-                    except ImportError:
-                        try:
-                            from langchain_ollama import OllamaLLM as Ollama
-                        except ImportError:
-                            from langchain.llms import Ollama
-                    
-                    local_url = local_model_url or "http://localhost:11434"
-                    llm = Ollama(
-                        model=model_name,
-                        base_url=local_url,
-                        temperature=0.3
-                    )
-                    
-                    # Create prompt and invoke
-                    template = PromptTemplate(
-                        input_variables=["job", "resume"],
-                        template="""
-You are an expert HR AI analyst with years of experience in recruitment and talent assessment.
-
-Compare the following resume with the job description and provide a comprehensive evaluation:
-
-1. **Overall Fit Score**: A numerical score from 0-100 indicating how well the candidate matches the job requirements.
-
-2. **Key Matching Skills**: List the top skills from the resume that directly match the job description requirements.
-
-3. **Missing Skills**: Identify critical skills mentioned in the job description that are not evident in the resume.
-
-4. **Suggested Improvements**: Provide 5-7 actionable bullet points on how the candidate can improve their resume to better match this job.
-
-5. **Strengths**: Highlight 3-5 key strengths of the candidate relevant to this role.
-
-6. **Weaknesses**: Identify 2-3 areas where the candidate may fall short.
-
-Format your response clearly with headers and bullet points for easy reading.
-
-JOB DESCRIPTION:
-{job}
-
-RESUME:
-{resume}
-
-Provide your evaluation:
-"""
-                    )
-                    
-                    prompt = template.format(
-                        job=job_desc,
-                        resume=resume_text[:6000]
-                    )
-                    
-                    response = llm.invoke(prompt)
-                    if hasattr(response, 'content'):
-                        return response.content
-                    return str(response)
-                    
-                except Exception as e:
-                    return f"## Error: Ollama not available\n\nPlease install:\n1. Ollama: https://ollama.ai\n2. Python package: pip install ollama\n3. Pull model: ollama pull {model_name}\n\nError: {str(e)}"
-            except Exception as e:
-                error_msg = str(e)
-                if "model" in error_msg.lower() and "not found" in error_msg.lower():
-                    return f"## Error: Model '{model_name}' not found\n\n**Solution:**\n1. Pull the model: `ollama pull {model_name}`\n2. Verify: `ollama list`\n3. Make sure Ollama is running: `ollama serve`"
-                elif "connection" in error_msg.lower() or "refused" in error_msg.lower():
-                    return f"## Error: Cannot connect to Ollama\n\n**Solution:**\n1. Make sure Ollama is running: `ollama serve`\n2. Or start Ollama service in background\n3. Check if port 11434 is available\n\n**Error:** {str(e)}"
-                else:
-                    return f"## Error connecting to local LLM\n\n**Steps to fix:**\n1. Make sure Ollama is installed: https://ollama.ai\n2. Start Ollama: `ollama serve`\n3. Pull model: `ollama pull {model_name}`\n4. Verify: `ollama list`\n\n**Error:** {str(e)}"
-        else:
-            # Use OpenAI
-            if not openai_key:
-                return "## Error: OpenAI API Key Required\n\nPlease provide an OpenAI API key in the .env file."
-            
-            # Try gpt-3.5-turbo first (most accessible), then try the requested model
-            models_to_try = [model_name] if model_name != "gpt-4" else ["gpt-3.5-turbo", "gpt-4-turbo-preview", "gpt-4"]
-            
-            llm = None
-            last_error = None
-            
-            for model in models_to_try:
-                try:
-                    # Try new API first, fallback to old API
-                    try:
-                        llm = ChatOpenAI(
-                            model=model,
-                            temperature=0.3,
-                            api_key=openai_key
-                        )
-                        # Test if model works by checking attributes
-                        break
-                    except TypeError:
-                        # Fallback for older LangChain versions
-                        llm = ChatOpenAI(
-                            model_name=model,
-                            temperature=0.3,
-                            openai_api_key=openai_key
-                        )
-                        break
-                except Exception as e:
-                    last_error = str(e)
-                    continue
-            
-            if llm is None:
-                return f"## Error: Model not available\n\nCould not access requested model. Tried: {', '.join(models_to_try)}\n\nError: {last_error}\n\n**Suggestion:** Try using 'gpt-3.5-turbo' which is more widely available."
-        
-        # Create prompt template
-        template = PromptTemplate(
-            input_variables=["job", "resume"],
-            template="""
-You are an expert HR AI analyst with years of experience in recruitment and talent assessment.
-
-Compare the following resume with the job description and provide a comprehensive evaluation:
-
-1. **Overall Fit Score**: A numerical score from 0-100 indicating how well the candidate matches the job requirements.
-
-2. **Key Matching Skills**: List the top skills from the resume that directly match the job description requirements.
-
-3. **Missing Skills**: Identify critical skills mentioned in the job description that are not evident in the resume.
-
-4. **Suggested Improvements**: Provide 5-7 actionable bullet points on how the candidate can improve their resume to better match this job.
-
-5. **Strengths**: Highlight 3-5 key strengths of the candidate relevant to this role.
-
-6. **Weaknesses**: Identify 2-3 areas where the candidate may fall short.
-
-Format your response clearly with headers and bullet points for easy reading.
-
-JOB DESCRIPTION:
-{job}
-
-RESUME:
-{resume}
-
-Provide your evaluation:
-"""
-        )
-        
-        prompt = template.format(
-            job=job_desc,
-            resume=resume_text[:6000]
-        )
-        
-        response = llm.invoke(prompt)
-        
-        if hasattr(response, 'content'):
-            evaluation = response.content
-        else:
-            evaluation = str(response)
-        
-        return evaluation
-    
+        return _call_openai(prompt, model_name, openai_key)
     except Exception as e:
-        error_msg = str(e)
-        if "429" in error_msg or "insufficient_quota" in error_msg or "quota" in error_msg.lower():
-            return (
-                "## Error: OpenAI API Quota Exceeded\n\n"
-                "Check your billing at: https://platform.openai.com/account/billing\n"
-                "Add credits or upgrade your plan."
-            )
-        elif "401" in error_msg or "invalid_api_key" in error_msg.lower():
-            return (
-                "## Error: Invalid API Key\n\n"
-                "Please check your OpenAI API key in the .env file."
-            )
-        else:
-            return f"## Error during evaluation\n\n{error_msg}"
+        m = str(e).lower()
+        if "quota" in m or "429" in m:
+            raise RuntimeError("OpenAI quota exceeded - check billing.") from e
+        if "401" in m or "invalid_api_key" in m:
+            raise RuntimeError("Invalid OpenAI API key.") from e
+        raise RuntimeError(f"OpenAI error: {e}") from e
 
 
-def save_evaluation_report(evaluation, job_desc, resume_text, output_dir="output"):
-    """
-    Save evaluation report as JSON with timestamp.
-    
-    Args:
-        evaluation: Evaluation text report
-        job_desc: Job description
-        resume_text: Resume text
-        output_dir: Output directory path
-    """
+# ---------- parsing ----------
+def parse_evaluation(raw: str) -> Evaluation:
+    """Tolerant JSON extraction -> validated Evaluation."""
+    text = raw.strip()
+    text = re.sub(r"$", "", text, flags=re.M).strip()
+    start, end = text.find("{"), text.rfind("}")
+    if start == -1 or end == -1:
+        raise ValueError("No JSON object in model output")
+    return Evaluation(**json.loads(text[start:end + 1]))
+
+
+def build_prompt(job_desc: str, resume_text: str,
+                 context_chunks: Optional[List[str]] = None,
+                 *, use_local: bool = False) -> Tuple[str, bool]:
+    """Returns (prompt, was_truncated) so the UI can warn honestly."""
+    limit = RESUME_LIMIT_LOCAL if use_local else RESUME_LIMIT_CLOUD
+    truncated = len(resume_text) > limit
+    chunks = context_chunks or []
+    context = "\n---\n".join(chunks) if chunks else "(retrieval unavailable)"
+    prompt = PROMPT_TEMPLATE.format(
+        job=job_desc[:JD_CHAR_LIMIT],
+        resume=resume_text[:limit],
+        context=context,
+        k=len(chunks),
+    )
+    return prompt, truncated
+
+
+def evaluate_once(job_desc: str, resume_text: str,
+                  context_chunks: Optional[List[str]] = None,
+                  *, use_local: bool = False, model_name: str = "llama3",
+                  openai_key: Optional[str] = None,
+                  repair: bool = False) -> Evaluation:
+    prompt, _ = build_prompt(job_desc, resume_text, context_chunks,
+                             use_local=use_local)
+    if repair:
+        prompt += REPAIR_SUFFIX
+    raw = call_llm(prompt, use_local=use_local, model_name=model_name,
+                   openai_key=openai_key)
+    return parse_evaluation(raw)
+
+
+# ---------- persistence ----------
+def save_evaluation_report(evaluation: dict, job_desc: str, resume_text: str,
+                           output_dir: str = "output",
+                           trace: Optional[dict] = None) -> Optional[str]:
     try:
-        # Create output directory if it doesn't exist
         os.makedirs(output_dir, exist_ok=True)
-        
-        # Generate timestamp
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        
-        # Prepare report data
-        report_data = {
-            "timestamp": timestamp,
-            "evaluation": evaluation,
-            "job_description": job_desc[:500],  # Store first 500 chars
-            "resume_preview": resume_text[:500],  # Store first 500 chars
-        }
-        
-        # Save to JSON
-        output_path = os.path.join(output_dir, f"evaluation_{timestamp}.json")
-        with open(output_path, "w", encoding="utf-8") as f:
-            json.dump(report_data, f, indent=2, ensure_ascii=False)
-        
-        return output_path
-    except Exception as e:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path = os.path.join(output_dir, f"evaluation_{ts}.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"timestamp": ts, "evaluation": evaluation,
+                       "trace": trace or {},
+                       "job_description": job_desc[:500],
+                       "resume_preview": resume_text[:500]},
+                      f, indent=2, ensure_ascii=False)
+        return path
+    except Exception:
         return None
-
