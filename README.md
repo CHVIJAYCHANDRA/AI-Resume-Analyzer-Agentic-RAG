@@ -1,248 +1,214 @@
-# AI Resume Analyzer (Agentic RAG)
+# Resume Analyzer: Retrieval-Grounded Scoring on a LangGraph Agent
 
-**A complete AI-powered resume analysis system that combines FAISS + LangChain ingestion, Streamlit UI, and GPT-4 evaluation pipeline to score resumes against job descriptions with zero API costs using local AI.**
+Resume/JD matching tools usually make one LLM call over the raw resume text and
+return prose. That has two problems: the score cannot be checked, and the model
+is free to justify it with things the resume never said.
 
-##  What Makes This Unique?
+This project addresses both. Retrieved resume passages are injected into the
+prompt, the model must return structured JSON with **verbatim evidence quotes**,
+and a verification step measures what fraction of those quotes actually appear
+in the resume. If grounding is too low, the agent repairs its own output once
+before returning.
 
-1. 100% FREE - Uses local Ollama models (no OpenAI API costs)
-2. Privacy-First - All processing happens locally, your data never leaves your machine
-3. Agentic RAG Architecture - Combines semantic search (FAISS) with LLM evaluation for intelligent suggestions
-4. Production-Ready - Optimized for local inference with streaming support
-5. Comprehensive Analysis - Fit score, skills matching, missing skills, improvement suggestions
+Runs fully offline — local LLM and local embeddings, no API key required.
 
-## Architecture
+---
 
-```
-AI Resume Analyzer (Agentic RAG)
-│
-├─ User Interface (Streamlit)
-│  │
-│  ├─ PDF Upload Component
-│  │  │
-│  └─ Job Description Input
-│     │
-│     │
-│     
-│
-├─ Processing Layer
-│  │
-│  ├─ PDF Parser (PyMuPDF)
-│  │  └─ Extract text from PDF
-│  │     │
-│  └─ Text Chunker (LangChain)
-│     └─ Split into chunks for embedding
-│        │
-│        │
-│        
-│
-├─ AI Engine Layer
-│  │
-│  ├─ Local LLM (Ollama)
-│  │  ├─ llama3
-│  │  ├─ llama2
-│  │  └─ mistral
-│  │     │
-│  ├─ RAG Engine (FAISS + LangChain)
-│  │  ├─ Build embeddings
-│  │  ├─ Vector search
-│  │  └─ Semantic matching
-│  │     │
-│  └─ Evaluation Pipeline
-│     ├─ GPT-4 style prompt
-│     ├─ Fit Score (0-100)
-│     ├─ Skills Analysis
-│     └─ Improvement Tips
-│        │
-│        │
-│        
-│
-└─ Output Layer
-   │
-   ├─ Evaluation Report
-   │  ├─ Overall Fit Score
-   │  ├─ Matching Skills
-   │  ├─ Missing Skills
-   │  ├─ Improvements
-   │  └─ Strengths/Weaknesses
-   │
-   ├─ RAG Suggestions
-   │  ├─ Semantic matches
-   │  ├─ Relevant sections
-   │  └─ Improvement hints
-   │
-   └─ Export
-      ├─ JSON (output/)
-      └─ Download TXT
-```
+## Agent topology
 
-## Requirements
+retrieve ──► evaluate ──► verify ──► done
+                 ▲            │
+                 └── repair ◄─┘   (conditional, max 2 attempts)
 
-- **Folder**: `/AI_Portfolio/1_AI_Resume_Analyzer`
-- **Subfolders**: `/utils` (evaluator.py, resume_parser.py, rag_engine.py), `/data`, `/output`
-- **Language**: Python 3.10+
-- **UI**: Streamlit
-- **Core Libraries**: langchain, openai, faiss-cpu, streamlit, PyMuPDF, python-dotenv, ollama
+| Node | Responsibility | Failure behaviour |
+|---|---|---|
+| `retrieve` | FAISS top-5 resume chunks most similar to the JD | degrades to no-retrieval, run continues |
+| `evaluate` | one structured JSON call, `temperature=0` | records error, empty result |
+| `verify` | schema check + evidence-grounding ratio | sets `verified=False` |
+| repair edge | re-runs `evaluate` with corrective instructions | bounded at `MAX_ATTEMPTS=2` |
 
-## Quick Start
+Regenerate this diagram from the compiled graph:
+bash
+python -c "from utils.agent_graph import build_graph; print(build_graph().get_graph().draw_ascii())"
 
-### Prerequisites
-- Python 3.10+
-- [Ollama](https://ollama.ai) installed
+---
 
-### Installation
+## The grounding check
 
-```bash
+Every evidence string returned by the model is matched against the resume text.
+Exact matching fails on real PDFs because extraction inserts line breaks
+mid-sentence, so quotes are whitespace-normalised, lowercased, and compared on a
+60-character prefix:
+python
+def _normalise(text: str) -> str:
+    return " ".join((text or "").split()).lower()
 
+`grounded_ratio` = supported quotes / total quotes. Below `0.5` the agent
+triggers a repair pass; unsupported quotes are surfaced in red in the UI rather
+than hidden.
+
+This is the difference between "the model said 87" and "the model said 87 and
+100% of its stated reasons are traceable to the document."
+
+---
+
+## Backends
+
+| Mode | LLM | Embeddings | API key | Cost |
+|---|---|---|---|---|
+| **Local** (default) | Ollama — llama3 / mistral / qwen2.5 / phi3 | `all-MiniLM-L6-v2` | none | $0 |
+| **Cloud** | gpt-4o-mini / gpt-4o / gpt-3.5-turbo | `text-embedding-3-small` | `OPENAI_API_KEY` | per-token |
+
+Both paths request JSON at the API level — Ollama `format="json"`, OpenAI
+`response_format={"type":"json_object"}` — so tolerant parsing is a fallback,
+not the primary strategy.
+
+`temperature=0.0` in both modes, so repeated runs are comparable. That is a
+prerequisite for evaluating the scorer at all.
+
+---
+
+## Setup
+bash
+git clone https://github.com/CHVIJAYCHANDRA/AI-Resume-Analyzer-Agentic-RAG
 cd AI-Resume-Analyzer-Agentic-RAG
-
-# Create virtual environment
-python -m venv venv
-
-# Activate virtual environment
-# Windows:
-venv\Scripts\activate
-# Linux/Mac:
-source venv/bin/activate
-
-# Install dependencies
+python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
+cp .env.example .env
 
-# Pull Ollama model (choose one)
-ollama pull llama3      
-# OR
-ollama pull llama2 
-# OR
-ollama pull mistral    
-```
-
-### Run the Application
-
-```bash
-streamlit run app.py
-```
-
-The app will open at `http://localhost:8501`
-
-## How to Use
-
-1. **Upload Resume**: Click "Browse files" and select your PDF resume
-2. **Enter Job Description**: Paste or type the complete job description
-3. **Select Model**: Choose local LLM (default: llama3) or OpenAI (requires API key)
-4. **Analyze**: Click "Analyze Resume" button
-5. **Review Results**: Get comprehensive evaluation report with:
-   - **Overall Fit Score** (0-100)
-   - **Key Matching Skills**
-   - **Missing Skills**
-   - **Suggested Improvements** (5-7 actionable points)
-   - **Strengths** (3-5 key strengths)
-   - **Weaknesses** (2-3 areas for improvement)
-6. **RAG-Based Suggestions**: Semantic search results from your resume
-
-## Functional Specification
-
-### 1. PDF Resume Upload
-- Supports PDF format
-- Extracts text using PyMuPDF (fitz)
-- Handles multi-page resumes
-
-### 2. Job Description Input
-- Text area for pasting job descriptions
-- Real-time word count
-- No character limits
-
-### 3. Resume Parsing
-- Automatic text extraction from PDF
-- Multi-page support
-- Error handling for corrupted/invalid PDFs
-
-### 4. GPT-4 Evaluation Pipeline
-- **Overall Fit Score**: Numerical score (0-100)
-- **Matching Skills**: Top skills from resume matching job requirements
-- **Missing Skills**: Critical skills not evident in resume
-- **Improvement Suggestions**: 5-7 actionable bullet points
-- **Strengths**: 3-5 key strengths relevant to role
-- **Weaknesses**: 2-3 areas where candidate may fall short
-
-### 5. Output Sections
-- **Resume Evaluation Report**: Comprehensive GPT-4 analysis
-- **RAG-Based Suggestions**: Semantic search using FAISS vector embeddings
-
-### 6. Results Export
-- Saves as JSON in `/output` folder with timestamp
-- Format: `evaluation_YYYYMMDD_HHMMSS.json`
-- Download as text file option
-
-##  Tech Stack
-
-| Layer | Technology | Purpose |
-|-------|-----------|---------|
-| **LLM** | Ollama (Local) / OpenAI (Optional) | Language understanding & evaluation |
-| **Framework** | LangChain | Text processing, prompt chaining |
-| **Vector DB** | FAISS | Semantic search & embedding store |
-| **UI** | Streamlit | Interactive frontend |
-| **Parser** | PyMuPDF | PDF text extraction |
-| **Language** | Python 3.10+ | Runtime environment |
-
-##  Project Structure
-
-```
-AI-Resume-Analyzer-Agentic-RAG/
-├── app.py                 # Main Streamlit application
-├── utils/
-│   ├── __init__.py
-│   ├── resume_parser.py   # PDF text extraction (PyMuPDF)
-│   ├── evaluator.py       # GPT-4/Ollama evaluation logic
-│   └── rag_engine.py      # FAISS vector store (LangChain)
-├── data/                  # Sample resumes (optional)
-├── output/                # Saved evaluation reports (JSON)
-├── requirements.txt       # Python dependencies
-├── .env                   # API keys (not in git)
-├── .gitignore            # Git ignore rules
-└── README.md             # This file
-```
-
-##  Configuration
-
-### Using Local AI (Recommended - FREE)
-
-The app defaults to local Ollama. Just ensure:
-- Ollama is installed: https://ollama.ai
-- Model is pulled: `ollama pull llama3`
-- Ollama service is running (starts automatically)
-
-### Using OpenAI (Optional - Costs Money)
-
-1. Create `.env` file:
-   ```
-   OPENAI_API_KEY=your_api_key_here
-   ```
-2. Uncheck "Use Local LLM" in the sidebar
-3. Select OpenAI model
-
-##  References
-
-- **Base ingestion logic** → https://github.com/imartinez/privateGPT
-- **UI inspiration** → https://github.com/yashk2810/Resume-Analyzer-using-LangChain
-
-##  Troubleshooting
-
-**Model not found?**
-```bash
+### Local mode (no key)
+bash
+ollama serve
 ollama pull llama3
-ollama list  # Verify installation
-```
+streamlit run app.py
 
-**Ollama connection error?**
-```bash
-ollama serve  # Start Ollama service
-```
+### Cloud mode
 
-**Slow first run?**
-- First run loads model into memory (30-90 seconds)
-- Subsequent runs are faster (model stays in memory)
+Add `OPENAI_API_KEY` to `.env`, then untick **Use local LLM** in the sidebar.
 
-**PDF extraction failed?**
-- Ensure PDF is text-based (not scanned image)
-- Try a different PDF file
+**First run downloads ~90 MB of MiniLM weights** (cached in
+`~/.cache/huggingface`, offline afterwards). `sentence-transformers` pulls
+PyTorch, so the install is large — this is the price of key-free retrieval.
+
+### Verify the wiring without the UI
+bash
+python -c "
+from utils.rag_engine import build_vector_index, query_vectorstore
+i = build_vector_index('Python engineer. Built RAG with FAISS. AWS CI/CD.', use_local=True)
+print(query_vectorstore(i, 'retrieval augmented generation', k=2))
+"
+
+---
+
+## Project structure
+
+app.py                  Streamlit UI, metrics, run trace, downloads
+utils/
+  prompts.py            prompt template + Pydantic Evaluation schema (single source)
+  evaluator.py          Ollama/OpenAI dispatch, prompt assembly, JSON parsing
+  rag_engine.py         chunking, embedding selection, FAISS index and search
+  agent_graph.py        LangGraph nodes, verification, conditional repair edge
+  resume_parser.py      PyMuPDF text extraction
+requirements.txt
+.env.example
+
+---
+
+## Output contract
+json
+{
+  "fit_score": 0,
+  "matching_skills": [],
+  "missing_skills": [],
+  "strengths": [],
+  "weaknesses": [],
+  "improvements": [],
+  "evidence": ["verbatim resume quote"]
+}
+
+Validated by `pydantic` (`fit_score` constrained to 0–100). Each run is written
+to `output/evaluation_<timestamp>.json` together with a trace:
+json
+{
+  "backend": "ollama-local",
+  "model": "llama3",
+  "attempts": 1,
+  "retrieved_chunks": 5,
+  "grounded_ratio": 1.0,
+  "resume_truncated": false,
+  "errors": []
+}
+
+Structured output plus a persisted trace is what makes offline evaluation
+possible later — prose reports cannot be aggregated.
+
+---
+
+## Engineering decisions
+
+- **Retrieval feeds the prompt.** Excerpts are injected before scoring, not
+  displayed alongside it as decoration.
+- **The prompt exists once.** `prompts.py` is the single source of truth; both
+  backends and the repair path format the same template.
+- **Failures raise, the graph decides.** Backend errors become `RuntimeError`
+  with actionable messages; nodes catch them and record to `state["errors"]`
+  instead of returning error text disguised as a result.
+- **Truncation is visible.** Long resumes are capped (4k local / 6k cloud) and
+  the UI says so, rather than dropping the tail silently.
+- **Embeddings are memoised** at module level so MiniLM is not reloaded on every
+  Streamlit rerun.
+
+---
+
+## Limitations
+
+- Fit scores are **not yet validated against labelled data** — no accuracy or
+  correlation figure is claimed. See below.
+- Grounding checks whether a quote exists in the resume, not whether it supports
+  the conclusion drawn from it.
+- English-language, text-based PDFs only. Scanned resumes need OCR.
+- Single-resume, single-JD; no batch mode or ranking across candidates.
+
+## Planned
+
+- `evals/` harness: labelled resume/JD pairs, score-vs-label correlation, and
+  run-to-run score variance
+- Retrieval ablation: chunk size and `k` against retrieval hit-rate
+- Cost/latency comparison across local and cloud backends at equal agreement
+
+---
+
+## Stack
+
+Python · Streamlit · LangGraph · LangChain · FAISS · sentence-transformers ·
+Ollama · OpenAI · PyMuPDF · Pydantic
+
+## License
+
+MIT — see [LICENSE](LICENSE).
 
 
+Claims removed from the old README
+
+
+| Removed | Why |
+|---|---|
+| "GPT-4 evaluation pipeline" in the header | default backend is local llama3 |
+| "Production-Ready" | no tests, no eval — unearned |
+| data/ and output/ in the structure tree | data/ does not exist in the repo; output/ is created at runtime, now stated as such |
+| "robust", "enterprise-level" | unbacked adjectives lower credibility |
+| "base logic from privateGPT / other repos" | read as derivative; the code is yours now |
+
+Claims added — and each is backed by code you've pasted
+
+
+| Claim | Backed by |
+|---|---|
+| retrieval feeds the prompt | build_prompt(..., context_chunks) in evaluator.py |
+| stateful agent, conditional control flow | AnalysisState + add_conditional_edges in agent_graph.py |
+| bounded repair / reliability | MAX_ATTEMPTS, route_after_verify |
+| grounding measurement | verify_node, grounded_ratio |
+| graceful degradation | retrieve_node try/except |
+| runs offline, no key | _get_local_embeddings + Ollama default |
+
+The Limitations section is deliberate. Naming what you haven't measured reads as more credible than silence  it's the pattern in openai/evals ("we are currently not accepting evals with custom code") and it pre-empts the first question a reviewer would ask.
